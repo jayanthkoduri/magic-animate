@@ -14,92 +14,95 @@ import warnings
 import torch
 from torch import distributed as dist
 
+def parse_master_env(init_method):
+    """
+    Parse the master address and port from the initialization method and set them as environment variables.
+    """
+    split = init_method.split("//")
+    if len(split) != 2:
+        raise ValueError("Initialization method should be split by '//' into exactly two elements")
 
-def distributed_init(args):
+    addr, port = split[1].split(":")
+    if len(addr.split(':')) != 2:
+        raise ValueError("Initialization method should be of the form <host_url>:<host_port>")
 
+    os.environ["MASTER_ADDR"] = addr
+    os.environ["MASTER_PORT"] = port
+
+def distributed_init(args, backend='nccl'):
+    """
+    Initialize a distributed training environment.
+    """
     if dist.is_initialized():
         warnings.warn("Distributed is already initialized, cannot initialize twice!")
         args.rank = dist.get_rank()
-    else:
-        print(
-            f"Distributed Init (Rank {args.rank}): "
-            f"{args.init_method}"
-        )
+        return args.rank
+
+    try:
+        print(f"Distributed Init (Rank {args.rank}): {args.init_method}")
         dist.init_process_group(
-            backend='nccl',
+            backend=backend,
             init_method=args.init_method,
             world_size=args.world_size,
             rank=args.rank,
         )
-        print(
-            f"Initialized Host {socket.gethostname()} as Rank "
-            f"{args.rank}"
-        )
 
-        if "MASTER_ADDR" not in os.environ or "MASTER_PORT" not in os.environ:
-            # Set for onboxdataloader support
-            split = args.init_method.split("//")
-            assert len(split) == 2, (
-                "host url for distributed should be split by '//' "
-                + "into exactly two elements"
-            )
+        parse_master_env(args.init_method)
 
-            split = split[1].split(":")
-            assert (
-                len(split) == 2
-            ), "host url should be of the form <host_url>:<host_port>"
-            os.environ["MASTER_ADDR"] = split[0]
-            os.environ["MASTER_PORT"] = split[1]
-
-        # perform a dummy all-reduce to initialize the NCCL communicator
+        # Dummy all-reduce to initialize NCCL communicator
         dist.all_reduce(torch.zeros(1).cuda())
 
         suppress_output(is_master())
         args.rank = dist.get_rank()
+    except Exception as e:
+        print(f"Failed to initialize distributed training: {e}", force=True)
+        raise
+
     return args.rank
 
-
 def get_rank():
-    if not dist.is_available():
-        return 0
-    if not dist.is_nccl_available():
-        return 0
-    if not dist.is_initialized():
+    """
+    Return the rank of the current process in the distributed training group.
+    """
+    if not dist.is_available() or not dist.is_nccl_available() or not dist.is_initialized():
         return 0
     return dist.get_rank()
 
-
 def is_master():
+    """
+    Check if the current process is the master process (rank 0).
+    """
     return get_rank() == 0
 
-
 def synchronize():
+    """
+    Synchronize all processes in the distributed training group.
+    """
     if dist.is_initialized():
         dist.barrier()
 
-
 def suppress_output(is_master):
-    """Suppress printing on the current device. Force printing with `force=True`."""
+    """
+    Suppress printing on non-master devices. Override print and warn functions.
+    """
     import builtins as __builtin__
 
-    builtin_print = __builtin__.print
-
-    def print(*args, **kwargs):
+    def custom_print(*args, **kwargs):
         force = kwargs.pop("force", False)
         if is_master or force:
-            builtin_print(*args, **kwargs)
+            __builtin__.print(*args, **kwargs)
 
-    __builtin__.print = print
+    __builtin__.print = custom_print
 
-    import warnings
-
-    builtin_warn = warnings.warn
-
-    def warn(*args, **kwargs):
+    def custom_warn(*args, **kwargs):
         force = kwargs.pop("force", False)
         if is_master or force:
-            builtin_warn(*args, **kwargs)
+            warnings.warn(*args, **kwargs)
 
-    # Log warnings only once
-    warnings.warn = warn
+    warnings.warn = custom_warn
     warnings.simplefilter("once", UserWarning)
+
+# Example usage
+if __name__ == "__main__":
+    args = ...  # Assume args are set up here
+    rank = distributed_init(args)
